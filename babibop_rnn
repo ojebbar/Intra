@@ -1,0 +1,446 @@
+
+
+'''Trains two recurrent neural networks based upon a story and a question.
+The resulting merged vector is then queried to answer a range of bAbI tasks.
+
+The results are comparable to those for an LSTM model provided in Weston et al.:
+"Towards AI-Complete Question Answering: A Set of Prerequisite Toy Tasks"
+http://arxiv.org/abs/1502.05698
+
+Task Number                  | FB LSTM Baseline | Keras QA
+---                          | ---              | ---
+QA1 - Single Supporting Fact | 50               | 100.0
+QA2 - Two Supporting Facts   | 20               | 50.0
+QA3 - Three Supporting Facts | 20               | 20.5
+QA4 - Two Arg. Relations     | 61               | 62.9
+QA5 - Three Arg. Relations   | 70               | 61.9
+QA6 - yes/No Questions       | 48               | 50.7
+QA7 - Counting               | 49               | 78.9
+QA8 - Lists/Sets             | 45               | 77.2
+QA9 - Simple Negation        | 64               | 64.0
+QA10 - Indefinite Knowledge  | 44               | 47.7
+QA11 - Basic Coreference     | 72               | 74.9
+QA12 - Conjunction           | 74               | 76.4
+QA13 - Compound Coreference  | 94               | 94.4
+QA14 - Time Reasoning        | 27               | 34.8
+QA15 - Basic Deduction       | 21               | 32.4
+QA16 - Basic Induction       | 23               | 50.6
+QA17 - Positional Reasoning  | 51               | 49.1
+QA18 - Size Reasoning        | 52               | 90.8
+QA19 - Path Finding          | 8                | 9.0
+QA20 - Agent's Motivations   | 91               | 90.7
+
+For the resources related to the bAbI project, refer to:
+https://research.facebook.com/researchers/1543934539189348
+
+Notes:
+
+- With default word, sentence, and query vector sizes, the GRU model achieves:
+  - 100% test accuracy on QA1 in 20 epochs (2 seconds per epoch on CPU)
+  - 50% test accuracy on QA2 in 20 epochs (16 seconds per epoch on CPU)
+In comparison, the Facebook paper achieves 50% and 20% for the LSTM baseline.
+
+- The task does not traditionally parse the question separately. This likely
+improves accuracy and is a good example of merging two RNNs.
+
+- The word vector embeddings are not shared between the story and question RNNs.
+
+- See how the accuracy changes given 10,000 training samples (en-10k) instead
+of only 1000. 1000 was used in order to be comparable to the original paper.
+
+- Experiment with GRU, LSTM, and JZS1-3 as they give subtly different results.
+
+- The length and noise (i.e. 'useless' story components) impact the ability for
+LSTMs / GRUs to provide the correct answer. Given only the supporting facts,
+these RNNs can achieve 100% accuracy on many tasks. Memory networks and neural
+networks that use attentional processes can efficiently search through this
+noise to find the relevant statements, improving performance substantially.
+This becomes especially obvious on QA2 and QA3, both far longer than QA1.
+'''
+
+from __future__ import print_function
+from functools import reduce
+import re
+import tarfile
+import os, sys
+import GPy, GPyOpt
+# set random seed for consistent shuffles and so on
+rnd_seed = int(os.getenv("RNDSEED", 4325))
+import numpy as np
+np.random.seed(rnd_seed)
+import random
+random.seed(rnd_seed) # not sure if needed or not
+import tensorflow as tf
+tf.set_random_seed(rnd_seed)
+
+import keras
+from keras.models import load_model
+from keras.utils.data_utils import get_file
+from keras.layers.embeddings import Embedding
+from keras import layers
+from keras.layers import recurrent
+from keras.models import Model
+from keras.preprocessing.sequence import pad_sequences
+
+from rotlstm import RotLSTM
+
+import datetime
+
+from eval_while_training import TestCallback
+
+def tokenize(sent):
+    '''Return the tokens of a sentence including punctuation.
+
+    >>> tokenize('Bob dropped the apple. Where is the apple?')
+    ['Bob', 'dropped', 'the', 'apple', '.', 'Where', 'is', 'the', 'apple', '?']
+    '''
+    return [x.strip() for x in re.split('(\W+)?', sent) if x.strip()]
+
+
+def parse_stories(lines, only_supporting=False):
+    '''Parse stories provided in the bAbi tasks format
+
+    If only_supporting is true,
+    only the sentences that support the answer are kept.
+    '''
+    data = []
+    story = []
+    for line in lines:
+        if type(line) != str:
+            line = line.decode('utf-8')
+        line = line.strip()
+        nid, line = line.split(' ', 1)
+        nid = int(nid)
+        if nid == 1:
+            story = []
+        if '\t' in line:
+            q, a, supporting = line.split('\t')
+            q = tokenize(q)
+            substory = None
+            if only_supporting:
+                # Only select the related substory
+                supporting = map(int, supporting.split())
+                substory = [story[i - 1] for i in supporting]
+            else:
+                # Provide all the substories
+                substory = [x for x in story if x]
+            data.append((substory, q, a))
+            story.append('')
+        else:
+            sent = tokenize(line)
+            story.append(sent)
+    return data
+
+
+def get_stories(f, only_supporting=False, max_length=None):
+    '''Given a file name, read the file, retrieve the stories,
+    and then convert the sentences into a single story.
+
+    If max_length is supplied,
+    any stories longer than max_length tokens will be discarded.
+    '''
+    data = parse_stories(f.readlines(), only_supporting=only_supporting)
+    flatten = lambda data: reduce(lambda x, y: x + y, data)
+    data = [(flatten(story), q, answer) for story, q, answer in data if not max_length or len(flatten(story)) < max_length]
+    return data
+
+
+def vectorize_stories(data, word_idx, story_maxlen, query_maxlen):
+    xs = []
+    xqs = []
+    ys = []
+    for story, query, answer in data:
+        x = [word_idx[w] for w in story]
+        xq = [word_idx[w] for w in query]
+        # let's not forget that index 0 is reserved
+        y = np.zeros(len(word_idx) + 1)
+        y[word_idx[answer]] = 1
+        xs.append(x)
+        xqs.append(xq)
+        ys.append(y)
+    return pad_sequences(xs, maxlen=story_maxlen), pad_sequences(xqs, maxlen=query_maxlen), np.array(ys)
+
+
+try:
+    path = get_file('babi-tasks-v1-2.tar.gz', origin='https://s3.amazonaws.com/text-datasets/babi_tasks_1-20_v1-2.tar.gz')
+except:
+    print('Error downloading dataset, please download it manually:\n'
+          '$ wget http://www.thespermwhale.com/jaseweston/babi/tasks_1-20_v1-2.tar.gz\n'
+          '$ mv tasks_1-20_v1-2.tar.gz ~/.keras/datasets/babi-tasks-v1-2.tar.gz')
+    raise
+tar = tarfile.open(path)
+    # Default QA1 with 1000 samples
+    # challenge = 'tasks_1-20_v1-2/en/qa1_single-supporting-fact_{}.txt'
+    # QA1 with 10,000 samples
+    # challenge = 'tasks_1-20_v1-2/en-10k/qa1_single-supporting-fact_{}.txt'
+    # QA2 with 1000 samples
+import tasks
+print("task number madafaka          "+sys.argv[1])
+tsCh = "{}/{}".format(tasks.sizes["1k"],tasks.tasks[int(sys.argv[1])])
+challenge = 'tasks_1-20_v1-2/' + tsCh
+print("CHALLENGE", challenge)
+    # QA2 with 10,000 samples
+    # challenge = 'tasks_1-20_v1-2/en-10k/qa2_two-supporting-facts_{}.txt'
+train = get_stories(tar.extractfile(challenge.format('train')))
+test = get_stories(tar.extractfile(challenge.format('test')))
+
+
+
+vocab = set()
+for story, q, answer in train + test:
+    vocab |= set(story + q + [answer])
+vocab = sorted(vocab)
+
+    # Reserve 0 for masking via pad_sequences
+vocab_size = len(vocab) + 1
+word_idx = dict((c, i + 1) for i, c in enumerate(vocab))
+story_maxlen = max(map(len, (x for x, _, _ in train + test)))
+query_maxlen = max(map(len, (x for _, x, _ in train + test)))
+
+x, xq, y = vectorize_stories(train, word_idx, story_maxlen, query_maxlen)
+tx, txq, ty = vectorize_stories(test, word_idx, story_maxlen, query_maxlen)
+
+print('vocab = {}'.format(vocab))
+print('x.shape = {}'.format(x.shape))
+print('xq.shape = {}'.format(xq.shape))
+print('y.shape = {}'.format(y.shape))
+print('story_maxlen, query_maxlen = {}, {}'.format(story_maxlen, query_maxlen))
+   # return x, xq, y, tx, txq, ty, story_maxlen, query_maxlen, vocab_size
+def createmodel(esz,ssz,qsz):
+    # play nice with the gpu memory
+    import tensorflow as tf
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth=True
+    sess = tf.Session(config=config)
+    import keras.backend.tensorflow_backend as KTF
+    KTF.set_session(sess)
+
+    print('Build model...')
+
+    sentence = layers.Input(shape=(story_maxlen,), dtype='int32')
+    encoded_sentence = layers.Embedding(vocab_size, qsz)(sentence)
+    encoded_sentence = layers.Dropout(0.3)(encoded_sentence)
+
+    question = layers.Input(shape=(query_maxlen,), dtype='int32')
+    encoded_question = layers.Embedding(vocab_size, esz)(question)
+    encoded_question = layers.Dropout(0.3)(encoded_question)
+    encoded_question = recurrent.LSTM(qsz)(encoded_question)
+    encoded_question = layers.RepeatVector(story_maxlen)(encoded_question)
+
+    merged = layers.add([encoded_sentence, encoded_question])
+
+    initial_state = None
+    merged = recurrent.LSTM(ssz)(merged, initial_state=initial_state)
+    merged = layers.Dropout(0.3)(merged)
+    preds = layers.Dense(vocab_size, activation='softmax')(merged)
+
+    model = Model([sentence, question], preds)
+    model.compile(optimizer='adam',
+                      loss='categorical_crossentropy',
+                      metrics=['accuracy'])
+
+    print('Training')
+    return model
+    '''
+    callbacks = []
+    if args.tensorboard:
+        # store everything, every epoch
+        callbacks.append(keras.callbacks.TensorBoard(
+            log_dir=os.path.join(args.o, "logs"),
+            histogram_freq=1,
+            batch_size=32,
+            write_graph=True,
+            write_grads=True,
+            write_images=True,
+            embeddings_freq=1,
+            embeddings_layer_names=None,
+            embeddings_metadata=None
+        ))
+
+    # save every savefreq epochs
+    if args.savefreq > 0:
+        callbacks.append(keras.callbacks.ModelCheckpoint(
+            os.path.join(args.o, "at_epoch_{epoch}.h5"),
+            monitor='val_loss',
+            verbose=0,
+            save_best_only=False,
+            save_weights_only=False,
+            mode='auto',
+            period=args.savefreq
+        ))
+
+    if args.testfreq > 0:
+        callbacks.append(TestCallback(
+            [tx, txq],
+            ty,
+            interval=args.testfreq,
+            output_path=os.path.join(args.o, "test_epochs.csv"),
+            batch_size=BATCH_SIZE
+        ))
+
+    callbacks.append(keras.callbacks.CSVLogger(os.path.join(args.o, "epochs.csv"), separator=',', append=False))
+
+    time_start = datetime.datetime.now()
+
+    delta = datetime.datetime.now() - time_start
+
+    if args.profile:
+        from tensorflow.python.client import timeline
+        tl = timeline.Timeline(run_metadata.step_stats)
+        ctf = tl.generate_chrome_trace_format()
+        with open(os.path.join(args.o,'timeline.json'), 'w') as f:
+            f.write(ctf)
+
+
+
+    tr_loss, tr_acc = model.evaluate([x, xq], y, batch_size=BATCH_SIZE)
+
+    model.save(os.path.join(args.o, "model.h5"))
+
+    with open(os.path.join(args.o, "eval"), "w") as f:
+        print("Test accuracy:      ", acc, file=f)
+        print("Test loss:          ", loss, file=f)
+
+        print("Train accuracy:     ", tr_acc, file=f)
+        print("Train loss:         ", tr_loss, file=f)
+
+        print("Training time (s):  ", delta.total_seconds(), file=f)
+
+    final_stats = {
+        "test_accuracy": acc,
+        "train_accuracy": tr_acc,
+        "test_loss": loss,
+        "train_loss": tr_loss,
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+        "validation_split": 0.05,
+        "training_samples": int(x.shape[0]),
+        'vocab': str(vocab),
+        'x.shape': str(x.shape),
+        'xq.shape': str(xq.shape),
+        'y.shape': str(y.shape),
+        'story_maxlen': str(story_maxlen),
+        'query_maxlen': str(query_maxlen),
+        'training_time_s': delta.total_seconds(),
+        "task": args.task,
+        "task_size": args.size,
+        "rnn": args.rnn,
+        "embedding_size": args.esz,
+        "sent_hidden_size": args.sentsz,
+        "query_hidden_size": args.querysz,
+    }
+
+    with open(os.path.join(args.o, "summary.json"), "w") as f:
+        import json
+        json.dump(final_stats, f, indent=4, sort_keys=True)
+
+    print('Test loss / test accuracy = {:.4f} / {:.4f}'.format(loss, acc))
+    '''
+def evalMod(model,ep,bs):
+    model.save('model.h5')
+    score  = 0
+    iter = 0
+    for iter in range(5):
+        testmod = load_model('model.h5')
+        testmod.fit([x, xq], y,
+                  batch_size=bs,
+                  epochs=ep,
+                  validation_split=0.05)
+        loss, acc = model.evaluate([tx, txq], ty, batch_size=bs)
+        score = score + acc
+    return score/30
+def run_eval(input):
+    model = createmodel(int(input[:,2]),int(input[:,4]),int(input[:,3]))
+    eval_scr = evalMod(model,int(input[:,0]),int(input[:,1]))
+    return eval_scr
+
+bounds = [{'name' : 'ep', 'type': 'discrete', 'domain': tuple([5*x for x in range(1,21)])},
+          {'name': 'bs', 'type': 'discrete', 'domain': tuple([16*x for x in range(1,17)])},
+          {'name': 'esz', 'type': 'discrete', 'domain': tuple([x for x in range(1,101)])},
+          {'name': 'qsz', 'type': 'discrete', 'domain': tuple([x for x in range(1,101)])},
+          {'name': 'ssz', 'type': 'discrete', 'domain': tuple([x for x in range(1,101)])}]
+opt_lstm = GPyOpt.methods.BayesianOptimization(f=run_eval,domain=bounds,num_cores=4,maximize=True)
+opt_lstm.run_optimization(max_iter=7)
+print("optimized params : {0}".format(opt_lstm.x_opt))
+filn = "{0}model.txt".format(sys.argv[1])
+f = open(filn,'w')
+f.write(str(opt_lstm.x_opt[0]))
+f.write(str(opt_lstm.x_opt[1]))
+f.write(str(opt_lstm.x_opt[2]))
+f.write(str(opt_lstm.x_opt[3]))
+f.write(str(opt_lstm.x_opt[4]))
+f.close()
+'''
+def parse_args():
+    import argparse
+    import tasks
+
+    parser = argparse.ArgumentParser("train babi RNN")
+
+    rnns = {
+        "LSTM": recurrent.LSTM,
+        "RotLSTM": RotLSTM,
+        "RotLSTM_Sigmoid": RotLSTM,
+        "RotLSTM_Sigmoid_Angle": RotLSTM,
+    }
+
+    rnn_args = {
+        "RotLSTM_Sigmoid": {"apply_activation_on_angle": True},
+        "RotLSTM_Sigmoid_Angle": {"apply_activation_on_angle": "angle"},
+    }
+
+    parser.add_argument("-task", type=int, choices=tasks.tasks.keys(), help="babi task number")
+    parser.add_argument("-size", choices=tasks.sizes.keys(), help="size of dataset", default="1k")
+    parser.add_argument("-rnn", choices=rnns.keys(), default="LSTM")
+    parser.add_argument("-o", type=str, help="output dir", default="output/<task>_<size>_<rnn>")
+    parser.add_argument("-esz", help="embedding size", type=int, default=50)
+    parser.add_argument("-sentsz", help="sent hiddne size", type=int, default=50)
+    parser.add_argument("-querysz", help="query hidden size", type=int, default=50)
+    parser.add_argument("-bs", help="batch size", type=int, default=32)
+    parser.add_argument("-epochs", help="num epochs", type=int, default=40)
+    parser.add_argument("--tensorboard", help="set to enable tensorboard logs", action="store_true", default=False)
+    parser.add_argument("-savefreq", help="save every savefreq epochs. 0 for none", type=int, default=0)
+    parser.add_argument("-testfreq", help="eval on test set every testfreq epochs. 0 for none", type=int, default=0)
+    parser.add_argument("--profile", help="enable profiling", action="store_true", default=False)
+
+
+    args = parser.parse_args()
+
+    args.challenge = "{}/{}".format(tasks.sizes[args.size], tasks.tasks[args.task])
+
+    # format output
+    output=str(args.o)
+
+    output = output.replace("<task>", str(args.task))
+    output = output.replace("<size>", tasks.sizes[args.size])
+    output = output.replace("<rnn>", str(args.rnn))
+
+    # make sure it's new folder
+    import os
+    tmp_o=output
+    i=0
+    while os.path.exists(tmp_o):
+        i+=1
+        tmp_o = output + "_" + str(i)
+    output=tmp_o
+
+    # make dirs for output
+    os.makedirs(output)
+
+    args.o = output
+    args.rnn_cell = rnns[args.rnn]
+
+    args.rnn_args = rnn_args.get(args.rnn, {})
+
+    with open(os.path.join(args.o, "args"), "w") as f:
+        print(args, file=f)
+
+    import datetime
+    with open(os.path.join(args.o, "timestamp"), "w") as f:
+        print(datetime.datetime.now(), file=f)
+
+    return args
+
+if __name__ == "__main__":
+    main(parse_args())
+'''
